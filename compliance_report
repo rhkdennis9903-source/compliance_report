@@ -1,0 +1,199 @@
+import streamlit as st
+import os
+import google.generativeai as genai
+from dotenv import load_dotenv
+import PyPDF2
+from io import StringIO
+
+# --- 設定頁面配置 ---
+st.set_page_config(
+    page_title="AI 文案法規合規性檢測助手",
+    page_icon="⚖️",
+    layout="wide"
+)
+
+# --- 側邊欄：設定與 API Key ---
+with st.sidebar:
+    st.header("⚙️ 設定")
+    
+    # 嘗試從環境變數讀取 API Key，如果沒有則顯示輸入框
+    load_dotenv()
+    env_api_key = os.getenv("GOOGLE_API_KEY")
+    
+    api_key = st.text_input(
+        "輸入 Google Gemini API Key",
+        value=env_api_key if env_api_key else "",
+        type="password",
+        help="請輸入您的 Gemini API Key 以啟動服務"
+    )
+
+    st.markdown("---")
+    st.info(
+        "**使用模型：**\n"
+        "優先：Gemini 3 Pro Preview\n"
+        "備援：Gemini 2.5 Pro\n\n"
+        "**檢測範圍：**\n"
+        "1. 台灣法規 (公平會、衛生局)\n"
+        "2. 您上傳的內部規範"
+    )
+
+# --- 核心功能函式 ---
+
+def extract_text_from_file(uploaded_file):
+    """從上傳的檔案 (TXT, PDF) 中提取文字"""
+    if uploaded_file is None:
+        return ""
+    
+    try:
+        if uploaded_file.type == "application/pdf":
+            reader = PyPDF2.PdfReader(uploaded_file)
+            text = ""
+            for page in reader.pages:
+                text += page.extract_text() + "\n"
+            return text
+        
+        elif uploaded_file.type == "text/plain":
+            stringio = StringIO(uploaded_file.getvalue().decode("utf-8"))
+            return stringio.read()
+        
+        else:
+            st.error("目前僅支援 PDF 與 TXT 格式")
+            return ""
+    except Exception as e:
+        st.error(f"檔案讀取失敗: {e}")
+        return ""
+
+def analyze_compliance(api_key, ad_copy, reference_data):
+    """呼叫 Gemini 進行法規比對"""
+    if not api_key:
+        st.error("請先輸入 API Key")
+        return None
+
+    genai.configure(api_key=api_key)
+
+    # 模型路由邏輯：優先使用 3-pro-preview
+    # 注意：實際使用時需確認帳號是否有權限存取 preview 模型，否則會 fallback
+    model_name = "gemini-3-pro-preview" 
+    
+    try:
+        # 建立系統提示詞 (System Instruction)
+        # 這裡設定 AI 為台灣法規專家
+        system_instruction = """
+        你是一位精通台灣法規的「首席合規長 (Chief Compliance Officer)」。
+        你的專長領域包含：
+        1. 《公平交易法》（不實廣告、誇大不實）
+        2. 《消費者保護法》
+        3. 特殊產業法規：如《藥事法》、《醫療器材管理法》、《化粧品衛生安全管理法》、《食品安全衛生管理法》。
+        
+        你的任務是審核使用者的行銷文案，並進行風險評估。
+        你必須極度嚴謹，對於「療效」、「保證」、「第一」、「唯一」等敏感詞彙保持高度警戒。
+        """
+
+        model = genai.GenerativeModel(
+            model_name=model_name,
+            system_instruction=system_instruction
+        )
+        
+        # 構建 Prompt
+        prompt = f"""
+        請針對以下【待審核文案】，依據【台灣法規知識】以及【使用者提供的參考資料（若有）】進行合規性分析。
+
+        ### 1. 使用者提供的參考資料 (內部規範/過往案例)：
+        {reference_data if reference_data else "無提供參考資料，請完全依據台灣法規判斷。"}
+
+        ### 2. 待審核文案：
+        {ad_copy}
+
+        ---
+        ### 請輸出分析報告（使用 Markdown 格式）：
+
+        1.  **總體風險評級**：(低 / 中 / 高 / 極高)
+        2.  **關鍵違規熱點分析**：
+            * 請逐條列出文案中可能違規的句子或詞彙。
+            * 引用相關法規（例如：「違反食品安全衛生管理法第28條，食品不得宣稱醫療效能」）。
+            * 若違反【參考資料】中的內部規定，也請指出。
+        3.  **修改建議**：
+            * 針對每一個違規點，提供具體的修改建議或是「安全替代詞彙」。
+        4.  **行銷邏輯檢視**：
+            * 在合規的前提下，這些修改是否保留了行銷力度？如果沒有，請提供更有說服力且合規的寫法。
+        """
+
+        # 設定生成參數 (降低隨機性，提高分析精準度)
+        generation_config = genai.types.GenerationConfig(
+            temperature=0.2,
+            top_p=0.8,
+            top_k=40
+        )
+
+        with st.spinner(f"正在使用 {model_name} 進行深度法規推理..."):
+            response = model.generate_content(prompt, generation_config=generation_config)
+            return response.text
+
+    except Exception as e:
+        # 若 3-pro-preview 失敗 (例如權限問題)，嘗試 fallback 到 gemini-2.5-pro
+        if "404" in str(e) or "not found" in str(e).lower():
+            try:
+                fallback_model = "gemini-2.5-pro"
+                st.warning(f"{model_name} 無法存取，切換至 {fallback_model} 進行分析...")
+                model = genai.GenerativeModel(fallback_model, system_instruction=system_instruction)
+                response = model.generate_content(prompt, generation_config=generation_config)
+                return response.text
+            except Exception as e2:
+                st.error(f"分析發生錯誤: {str(e2)}")
+                return None
+        else:
+            st.error(f"分析發生錯誤: {str(e)}")
+            return None
+
+# --- 主介面 ---
+
+st.title("🛡️ 台灣行銷文案法規快篩系統")
+st.markdown("利用 **Gemini 3 Pro** 的強大推理能力，比對 **台灣現行法規** 與您的 **內部資料庫**。")
+
+col1, col2 = st.columns([1, 1])
+
+with col1:
+    st.subheader("1. 輸入待審核文案")
+    
+    input_method = st.radio("輸入方式", ["直接貼上文字", "上傳文案檔案"], horizontal=True)
+    
+    ad_copy_text = ""
+    
+    if input_method == "直接貼上文字":
+        ad_copy_text = st.text_area("請在此貼上文案內容", height=300, placeholder="例如：這款益生菌能有效治療過敏，保證三天見效...")
+    else:
+        ad_file = st.file_uploader("上傳文案 (TXT/PDF)", type=["txt", "pdf"], key="ad_file")
+        if ad_file:
+            ad_copy_text = extract_text_from_file(ad_file)
+            st.success(f"已讀取文案，長度：{len(ad_copy_text)} 字")
+
+with col2:
+    st.subheader("2. 提供參考資料庫 (選填)")
+    st.markdown("您可以上傳：過往審核過的 Pass 案例、公司內部的 Brand Guidelines、或特定的法規備忘錄。")
+    
+    ref_file = st.file_uploader("上傳參考資料 (TXT/PDF)", type=["txt", "pdf"], key="ref_file")
+    ref_text = ""
+    
+    if ref_file:
+        ref_text = extract_text_from_file(ref_file)
+        with st.expander("預覽參考資料內容"):
+            st.text(ref_text[:500] + "...")
+
+# --- 執行按鈕 ---
+st.markdown("---")
+if st.button("🚀 開始法規合規性分析", type="primary", use_container_width=True):
+    if not ad_copy_text:
+        st.warning("⚠️ 請務必提供「待審核文案」")
+    else:
+        result = analyze_compliance(api_key, ad_copy_text, ref_text)
+        if result:
+            st.markdown("## 📋 分析報告")
+            st.markdown(result)
+            
+            # 提供下載報告的功能
+            st.download_button(
+                label="📥 下載分析報告 (TXT)",
+                data=result,
+                file_name="compliance_report.md",
+                mime="text/markdown"
+            )
